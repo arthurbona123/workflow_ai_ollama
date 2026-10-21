@@ -1,0 +1,45 @@
+name: CI - LangGraph Proxy Tests & Coverage
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+jobs:
+  test-and-coverage:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout do repositório
+        uses: actions/checkout@v4
+
+      - name: Configurar Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Instalar dependências
+        run: |
+          python -m pip install --upgrade pip
+          pip install fastapi uvicorn pydantic tavily-python langchain-core langgraph langchain-openai
+          pip install pytest pytest-cov pytest-asyncio httpx
+
+      - name: Executar PyTest com Coverage.py
+        env:
+          OPENAI_API_KEY: "ollama-mock"
+          TAVILY_API_KEY: "tvly-mock"
+        run: |
+          pytest test_server.py \
+            --cov=server \
+            --cov-report=term-missing \
+            --cov-report=xml \
+            --cov-report=markdown \
+            --cov-fail-under=80
+
+      - name: Publicar Relatório de Cobertura no PR Summary
+        if: always()
+        run: |
+          echo "### 📊 Relatório de Cobertura (Coverage.py)" >> $GITHUB_STEP_SUMMARY
+          cat coverage.md >> $GITHUB_STEP_SUMMARY
