@@ -1,0 +1,21 @@
+# Usa o modelo BASE de 1.5B (muito mais rápido e preciso para Fill-In-The-Middle que a versão Instruct)
+FROM qwen2.5:1.5b
+
+# Temperatura quase zero para geração determinística de sintaxe
+PARAMETER temperature 0.05
+PARAMETER top_p 0.9
+PARAMETER repeat_penalty 1.05
+
+# Janela de contexto enxuta (1024 tokens) para manter o consumo de VRAM mínimo e TTFT instantâneo
+PARAMETER num_ctx 1024
+
+# Limita a geração a no máximo 128 tokens (evita que o autocomplete tente escrever o arquivo inteiro)
+PARAMETER num_predict 128
+
+# Stop tokens estritos para encerrar a sugestão assim que fechar o bloco ou linha lógica
+PARAMETER stop "<|endoftext|>"
+PARAMETER stop "<|fim_prefix|>"
+PARAMETER stop "<|fim_middle|>"
+PARAMETER stop "<|fim_suffix|>"
+PARAMETER stop "<|file_sep|>"
+PARAMETER stop "\n\n"
