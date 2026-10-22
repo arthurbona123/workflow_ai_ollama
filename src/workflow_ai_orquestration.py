@@ -21,8 +21,7 @@ TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "tvly-dev-4Qnmor-ew1Q9iV5aVa11
 
 llm = ChatOpenAI(
     base_url="http://localhost:11434/v1",
-    model="qwen2.5-chat:1.5b",
-    temperature=0.2
+    model="qwen2.5-chat:1.5b"
 )
 
 tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
