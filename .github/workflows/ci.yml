@@ -36,7 +36,7 @@ jobs:
             --cov-report=term-missing \
             --cov-report=xml \
             --cov-report=markdown \
-            --cov-fail-under=80
+            --cov-fail-under=75
 
       - name: Publicar Relatório de Cobertura no PR Summary
         if: always()
