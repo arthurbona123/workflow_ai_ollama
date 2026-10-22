@@ -4,7 +4,7 @@ from fastapi.testclient import TestClient
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 
 # Importa os componentes do nosso servidor
-from workflow_ai_python_ollama import (
+from server import (
     app,
     SESSION_MEMORY,
     ContextSummary,
