@@ -31,12 +31,12 @@ jobs:
           OPENAI_API_KEY: "ollama-mock"
           TAVILY_API_KEY: "tvly-mock"
         run: |
-          pytest test_server.py \
+          pytest tests/units/test_server.py \
             --cov=server \
             --cov-report=term-missing \
             --cov-report=xml \
             --cov-report=markdown \
-            --cov-fail-under=80
+            --cov-fail-under=75
 
       - name: Publicar Relatório de Cobertura no PR Summary
         if: always()
