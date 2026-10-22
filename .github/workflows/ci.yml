@@ -31,7 +31,7 @@ jobs:
           OPENAI_API_KEY: "ollama-mock"
           TAVILY_API_KEY: "tvly-mock"
         run: |
-          pytest tests/units/test_server.py \
+          pytest /tests/units/test_server.py \
             --cov=server \
             --cov-report=term-missing \
             --cov-report=xml \
