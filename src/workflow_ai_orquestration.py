@@ -1,65 +1,109 @@
 import os
+import re
 import json
 import time
 import uuid
-from typing import List, TypedDict, Optional, Dict, Any
-from pydantic import BaseModel, Field
-from fastapi import FastAPI
+from typing import List, TypedDict, Optional, Any
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 import uvicorn
-
 from tavily import TavilyClient
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
 from langgraph.graph import StateGraph, END
 from langchain_openai import ChatOpenAI
+from dotenv import load_dotenv
 
 # ==========================================
-# 1. CONFIGURAÇÃO DOS CLIENTES (OLLAMA + TAVILY)
+# 1. CONFIGURAÇÃO DE AMBIENTE E API
 # ==========================================
-os.environ["OPENAI_API_KEY"] = "ollama"
-TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "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") # colocar no .env depois
 
-llm = ChatOpenAI(
-    base_url="http://localhost:11434/v1",
-    model="qwen2.5-chat:1.5b",
-    temperature=0.2
+load_dotenv()
+
+os.environ["OPENAI_API_KEY"] = "lm-studio"
+TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")
+if not TAVILY_API_KEY:
+    raise ValueError("⚠️ TAVILY_API_KEY não encontrada! Verifique o seu arquivo .env.")
+
+app = FastAPI(title="Continue.dev LangGraph Proxy", version="0.4.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ==========================================
+# 2. CONFIGURAÇÃO DOS MODELOS (LM STUDIO)
+# ==========================================
+
+# Gemma 4 (Principal / Reasoning)
+main_llm = ChatOpenAI(
+    base_url="http://localhost:1234/v1",
+    model="google/gemma4-e4b",
+    temperature=0.2,
+    top_p=0.9
+)
+
+# LFM 2.5 1.2B (Helper de Memória)
+helper_llm = ChatOpenAI(
+    base_url="http://localhost:1234/v1",
+    model="liquid/lfm2.5-1.2b",
+    temperature=0.3,
+    top_p=0.9,
+    max_tokens=1024
 )
 
 tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
 
-# Cache leve em memória para persistir o resumo entre chamadas stateless do Continue.dev
+# Cache de Sessão (Como o Continue envia o histórico todo, usamos isso para não resumir tudo do zero)
 SESSION_MEMORY = {
     "summary": "",
     "summarized_count": 0
 }
 
 # ==========================================
-# 2. SCHEMAS PYDANTIC (LANGGRAPH & FASTAPI)
+# 3. SYSTEM PROMPTS DA ARQUITETURA
 # ==========================================
-class ContextSummary(BaseModel):
-    resumo_atualizado: str = Field(
-        description="Resumo técnico conciso contendo decisões de arquitetura, arquivos alterados e contexto acumulado."
-    )
+MAIN_SYSTEM_PROMPT = (
 
+    "Atue como Engenheiro da Computação Sênior focado em Performance, Back-end e Arch Linux.\n"
+    "DIRETRIZES DE LEITURA DO PROMPT:\n"
+    "1. [1. MEMÓRIA DE CURTO PRAZO] contém o contexto e diretrizes da IDE. NUNCA responda a perguntas passadas.\n"
+    "2. [2. DADOS DE BUSCA NA WEB] traz informações extras e documentações para consulta técnica.\n"
+    "3. [3. PROMPT ATUAL DO USUÁRIO] é a sua única tarefa ativa. Responda a ela de forma profunda e técnica.\n"
+    "4. Envolva blocos de código sempre dentro de tags Markdown adequadas."
+)
+
+HELPER_SYSTEM_PROMPT = (
+
+    "Sua função é sumarizar o histórico de logs técnicos de forma telegráfica em TERCEIRA PESSOA.\n"
+    "Capture decisões, arquiteturas, erros e intenções dos códigos discutidos.\n"
+    "PROIBIDO responder, PROIBIDO saudações, PROIBIDO usar primeira pessoa ('Eu')."
+)
+
+# ==========================================
+# 4. SCHEMAS PYDANTIC (API COMPATÍVEL & LANGGRAPH)
+# ==========================================
 class SearchDecision(BaseModel):
-    need_search: bool = Field(
-        description="True APENAS se exigir documentação externa recente, erro específico ou dados em tempo real."
-    )
+
+    need_search: bool = Field(description="True se o pedido pedir pesquisa externa ou documentação recente. Caso contrário, False.")
+
     query: Optional[str] = Field(
         default=None,
-        description="Query de busca curta e técnica otimizada para motores de busca."
+        description="Query em inglês (máx 6 palavras). OBRIGATÓRIO incluir o termo/framework principal."
     )
 
-class WebSearchOutput(BaseModel):
-    query: str = Field(description="Query submetida ao buscador.")
-    resultado_busca: str = Field(description="Snippets consolidados (top_k).")
-
-# Schemas de compatibilidade com a API da OpenAI (esperados pelo Continue.dev)
 class OpenAIMessage(BaseModel):
+
     role: str
-    content: Any  # Pode vir como str ou lista de blocos (multimodal/contexto do Continue)
+    content: Any
 
 class ChatCompletionRequest(BaseModel):
+
     model: str
     messages: List[OpenAIMessage]
     stream: Optional[bool] = True
@@ -67,177 +111,265 @@ class ChatCompletionRequest(BaseModel):
     max_tokens: Optional[int] = None
 
 # ==========================================
-# 3. DEFINIÇÃO DO ESTADO E NÓS DO LANGGRAPH
+# 5. FUNÇÕES AUXILIARES SINTÁTICAS
+# ==========================================
+def normalize_content(content: Any) -> str:
+
+    if isinstance(content, str):
+
+        return content
+    
+    if isinstance(content, list):
+
+        return "\n".join([item.get("text", "") for item in content if isinstance(item, dict) and "text" in item])
+    
+    return str(content)
+
+def sanitize_user_prompt(raw_text: str) -> str:
+
+    lines = [line.rstrip() for line in raw_text.splitlines()]
+    cleaned = []
+
+    for line in lines:
+
+        cleaned.append(" ".join(line.split()) if line and not line.startswith((" ", "\t")) else line)
+
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(cleaned)).strip()
+
+def assemble_final_prompt(memoria: str, ide_prompt: str, dados_web: str, prompt_usuario: str) -> List[BaseMessage]:
+
+    texto_memoria = f"[DIRETRIZES DA IDE]\n{ide_prompt}\n\n[HISTÓRICO]\n{memoria}" if ide_prompt else memoria
+    
+    structured_text = (
+
+        "==================================================\n"
+        "[1. MEMÓRIA DE CURTO PRAZO - CONTEXTO PASSADO]\n"
+        f"{texto_memoria}\n\n"
+        "==================================================\n"
+        "[2. DADOS DE BUSCA NA WEB - CONHECIMENTO ADICIONAL]\n"
+        f"{dados_web}\n\n"
+        "==================================================\n"
+        "[3. PROMPT ATUAL DO USUÁRIO - TAREFA A RESPONDER]\n"
+        f"{prompt_usuario}\n"
+        "=================================================="
+    )
+    return [
+
+        SystemMessage(content=MAIN_SYSTEM_PROMPT),
+        HumanMessage(content=structured_text)
+    ]
+
+# ==========================================
+# 6. DEFINIÇÃO DO ESTADO E NÓS DO LANGGRAPH
 # ==========================================
 class AgentState(TypedDict):
+
     messages: List[BaseMessage]
     system_prompt_ide: str
-    summary: str
+    short_term_memory: str
+    clean_user_prompt: str
     search_decision: Optional[SearchDecision]
-    web_context: Optional[WebSearchOutput]
+    web_search_data: str
     final_prompt: List[BaseMessage]
 
-def context_manager_node(state: AgentState):
+def memory_and_input_prep_node(state: AgentState):
+
     messages = state.get("messages", [])
     total_msgs = len(messages)
     
-    # Se o usuário clicou em "New Session" no Continue, reseta o cache de resumo
+    # Se for uma nova sessão no Continue.dev (User msg única ou poucas)
     if total_msgs <= 2:
+
         SESSION_MEMORY["summary"] = ""
         SESSION_MEMORY["summarized_count"] = 0
 
     current_summary = SESSION_MEMORY["summary"]
     summarized_count = SESSION_MEMORY["summarized_count"]
 
-    # Se passar de 6 mensagens (User/AI), compacta as antigas e preserva as 4 mais recentes
-    if total_msgs > 6:
-        cutoff = total_msgs - 4
+    if total_msgs > 3:
+
+        cutoff = total_msgs - 1
         new_to_summarize = messages[summarized_count:cutoff]
-        recent_messages = messages[-4:]
+        recent_messages = messages[-1:]
         
         if new_to_summarize:
-            history_text = "\n".join(
-                [f"{'Dev' if isinstance(m, HumanMessage) else 'IA'}: {m.content[:800]}" for m in new_to_summarize]
-            )
-            summary_prompt = (
-                f"Resumo anterior: {current_summary if current_summary else 'Nenhum'}\n\n"
-                f"Novas interações:\n{history_text}\n\n"
-                "Instrução: Atualize o resumo técnico mantendo nomes de funções, decisões e problemas atuais. Seja direto."
-            )
-            try:
-                structured_llm = llm.with_structured_output(ContextSummary)
-                res = structured_llm.invoke([HumanMessage(content=summary_prompt)])
-                current_summary = res.resumo_atualizado
-            except Exception:
-                res = llm.invoke([HumanMessage(content=summary_prompt + "\nRetorne APENAS o resumo.")])
-                current_summary = res.content.strip()
-                
-            SESSION_MEMORY["summary"] = current_summary
-            SESSION_MEMORY["summarized_count"] = cutoff
-            print(f"[LangGraph Proxy] Histórico comprimido ({len(current_summary)} chars). Ativas: {len(recent_messages)}")
-            
-        return {"messages": recent_messages, "summary": current_summary, "web_context": None}
-        
-    return {"messages": messages, "summary": current_summary, "web_context": None}
 
-def search_router_node(state: AgentState):
-    last_user_msg = state["messages"][-1].content
-    summary = state.get("summary", "")
-    
-    # Limita a leitura aos últimos 1000 caracteres para focar na pergunta real do dev (ignorando anexos gigantes do @file)
-    clean_question = last_user_msg[-1000:] if len(last_user_msg) > 1000 else last_user_msg
-    
+            history_text = "\n".join(
+
+                [f"- {'Usuário' if isinstance(m, HumanMessage) else 'IA'}: {m.content}" for m in new_to_summarize]
+            )
+
+            prompt_memoria = (
+
+                f"Fatos anteriores:\n{current_summary if current_summary else 'Nenhum'}\n\n"
+                f"Novos logs de memória e contexto para integrar:\n{history_text}"
+            )
+
+            try:
+
+                res = helper_llm.invoke([
+
+                    SystemMessage(content=HELPER_SYSTEM_PROMPT),
+                    HumanMessage(content=prompt_memoria)
+                ])
+
+                current_summary = res.content.strip()
+                SESSION_MEMORY["summary"] = current_summary
+                SESSION_MEMORY["summarized_count"] = cutoff
+                print(f"[Memória LFM 1.2B] Atualizada ({len(current_summary)} chars)")
+
+            except Exception as e:
+
+                print(f"[Erro LFM 1.2B]: {e}")
+                
+        active_messages = recent_messages
+
+    else:
+
+        active_messages = messages
+
+    prior_buffer = "\n".join([f"{'Usuário' if isinstance(m, HumanMessage) else 'IA'}: {m.content}" for m in active_messages[:-1]])
+    partes_memoria = filter(None, [current_summary, prior_buffer])
+    memoria_consolidada = "\n\n".join(partes_memoria) if partes_memoria else "Nenhum histórico."
+
+    raw_user_input = active_messages[-1].content
+    clean_user_input = sanitize_user_prompt(raw_user_input)
+
+    return {
+
+        "short_term_memory": memoria_consolidada,
+        "clean_user_prompt": clean_user_input,
+        "web_search_data": "Nenhuma busca web solicitada.",
+    }
+
+def gemma_router_node(state: AgentState):
+
     router_prompt = (
-        f"Contexto prévio: {summary}\n"
-        f"Pedido do desenvolvedor: {clean_question}\n\n"
-        "Precisa consultar documentação atualizada ou busca web externa para responder? Se sim, crie uma query curta."
+
+        f"Memória:\n{state['short_term_memory']}\n\n"
+        f"Prompt do Usuário:\n{state['clean_user_prompt']}\n\n"
+        "Precisa pesquisar algo externo (Tavily) para responder?"
     )
-    
+
     try:
-        decider_llm = llm.with_structured_output(SearchDecision)
-        decision = decider_llm.invoke([HumanMessage(content=router_prompt)])
-    except Exception:
+
+        structured_llm = main_llm.with_structured_output(SearchDecision)
+        decision = structured_llm.invoke([
+
+            SystemMessage(content="Responda baseado no schema exigido para buscas na web, caso seja relevante ao contexto atual."),
+            HumanMessage(content=router_prompt)
+        ])
+
+    except Exception as e:
+
+        print(f"[Erro Router Gemma]: {e}")
         decision = SearchDecision(need_search=False, query=None)
         
+    if decision.need_search:
+
+        print(f"[Gemma Router] Busca solicitada: {decision.query}")
+
     return {"search_decision": decision}
 
 def tavily_search_node(state: AgentState):
+
     query = state["search_decision"].query
+
     try:
-        response = tavily_client.search(
-            query=query,
-            search_depth="basic",
-            max_results=2,              # top_k = 2 para proteger o contexto do modelo
-            include_raw_content=False,
-            include_answer=False
-        )
+
+        response = tavily_client.search(query=query, search_depth="basic", max_results=2)
         results = response.get("results", [])
-        consolidated = "\n".join([f"- [{r.get('title')}]: {r.get('content')}" for r in results]) if results else "Sem resultados."
+        clean_snippets = []
+
+        for idx, r in enumerate(results, 1):
+
+            content_clean = re.sub(r"\s{2,}", " ", r.get("content", "").replace("[...]", " ").strip())
+            clean_snippets.append(f"Fonte {idx}:\n{content_clean}")
+        web_text = "\n\n".join(clean_snippets) if clean_snippets else "Nenhum resultado relevante."
+
     except Exception as e:
-        consolidated = f"Erro na busca: {str(e)}"
+
+        web_text = f"Falha na busca web: {e}"
         
-    search_output = WebSearchOutput(query=query, resultado_busca=consolidated)
-    print(f"[Tavily] Busca concluída para: '{query}'")
-    return {"web_context": search_output}
+    return {"web_search_data": web_text}
 
 def prompt_builder_node(state: AgentState):
-    """Monta a lista enxuta de mensagens que será enviada ao Ollama (com ou sem streaming)."""
-    prompt_messages = []
-    
-    if state.get("system_prompt_ide"):
-        prompt_messages.append(SystemMessage(content=state["system_prompt_ide"]))
-        
-    if state.get("summary"):
-        prompt_messages.append(SystemMessage(content=f"Resumo comprimido do histórico:\n{state['summary']}"))
-        
-    if state.get("web_context"):
-        wc = state["web_context"]
-        prompt_messages.append(
-            SystemMessage(content=f"Busca Web (Query: {wc.query}):\n{wc.resultado_busca}")
-        )
-        
-    prompt_messages.extend(state["messages"])
-    return {"final_prompt": prompt_messages}
 
-def route_after_check(state: AgentState):
+    """Constrói o prompt, mas NÃO executa a LLM (Para permitir SSE Streaming no FastAPI)."""
+
+    final_messages = assemble_final_prompt(
+
+        memoria=state["short_term_memory"],
+        ide_prompt=state["system_prompt_ide"],
+        dados_web=state["web_search_data"],
+        prompt_usuario=state["clean_user_prompt"]
+    )
+    return {"final_prompt": final_messages}
+
+def route_after_router(state: AgentState):
+
     decision = state.get("search_decision")
     if decision and decision.need_search and decision.query:
+
         return "web_search"
     return "prompt_builder"
 
-# Compilação do Grafo Pré-Inferência
 workflow = StateGraph(AgentState)
-workflow.add_node("memory_manager", context_manager_node)
-workflow.add_node("search_router", search_router_node)
+
+workflow.add_node("memory_and_input_prep", memory_and_input_prep_node)
+workflow.add_node("gemma_router", gemma_router_node)
 workflow.add_node("web_search", tavily_search_node)
 workflow.add_node("prompt_builder", prompt_builder_node)
 
-workflow.set_entry_point("memory_manager")
-workflow.add_edge("memory_manager", "search_router")
-workflow.add_conditional_edges("search_router", route_after_check, {
+workflow.set_entry_point("memory_and_input_prep")
+workflow.add_edge("memory_and_input_prep", "gemma_router")
+
+workflow.add_conditional_edges("gemma_router", route_after_router, {
     "web_search": "web_search",
     "prompt_builder": "prompt_builder"
 })
+
 workflow.add_edge("web_search", "prompt_builder")
 workflow.add_edge("prompt_builder", END)
-
 app_graph = workflow.compile()
 
 # ==========================================
-# 4. ENDPOINT FASTAPI (OPENAI-COMPATIBLE)
+# 7. ENDPOINT SSE (VS CODE / CONTINUE.DEV)
 # ==========================================
-app = FastAPI(title="LangGraph Proxy for Continue.dev")
-
-def normalize_content(content: Any) -> str:
-    """Extrai texto caso o Continue envie array de objetos no campo content."""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        return "\n".join([item.get("text", "") for item in content if isinstance(item, dict) and "text" in item])
-    return str(content)
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest):
+
     lc_messages = []
     system_prompt_ide = ""
     
-    # Separa a SystemMessage da IDE do histórico conversacional
+    # 1. Separa o System Prompt gerado pela extensão Continue.dev das mensagens reais
     for m in request.messages:
+
         text = normalize_content(m.content)
         if m.role == "system":
+
             system_prompt_ide += text + "\n"
         elif m.role == "user":
+
             lc_messages.append(HumanMessage(content=text))
         elif m.role == "assistant":
+
             lc_messages.append(AIMessage(content=text))
 
-    # 1. Roda o Grafo (Poda + Sumarização + Busca Tavily)
+    if not lc_messages:
+
+        raise HTTPException(status_code=400, detail="Sem mensagens do usuário.")
+
+    # 2. Executa a Preparação no LangGraph (Memória -> Router -> Busca -> Prompt Triplo)
     initial_state: AgentState = {
+
         "messages": lc_messages,
         "system_prompt_ide": system_prompt_ide.strip(),
-        "summary": "",
+        "short_term_memory": "",
+        "clean_user_prompt": "",
         "search_decision": None,
-        "web_context": None,
+        "web_search_data": "",
         "final_prompt": []
     }
     
@@ -247,40 +379,58 @@ async def chat_completions(request: ChatCompletionRequest):
     req_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     created_time = int(time.time())
 
-    # 2. Retorno em Streaming SSE (Exigido pelo Continue.dev para UI fluida e Apply)
+    # 3. Entrega Assíncrona em Stream SSE (Server-Sent Events) compatível com OpenAI
     if request.stream:
+
         async def sse_generator():
-            async for chunk in llm.astream(final_prompt):
-                if chunk.content:
-                    payload = {
-                        "id": req_id,
-                        "object": "chat.completion.chunk",
-                        "created": created_time,
-                        "model": request.model,
-                        "choices": [{
-                            "index": 0,
-                            "delta": {"content": chunk.content},
-                            "finish_reason": None
-                        }]
-                    }
-                    yield f"data: {json.dumps(payload)}\n\n"
-            
-            # Pacote de fechamento da stream
-            end_payload = {
-                "id": req_id,
-                "object": "chat.completion.chunk",
-                "created": created_time,
-                "model": request.model,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
-            }
-            yield f"data: {json.dumps(end_payload)}\n\n"
-            yield "data: [DONE]\n\n"
-            
+
+            try:
+
+                async for chunk in main_llm.astream(final_prompt):
+
+                    if chunk.content:
+
+                        payload = {
+
+                            "id": req_id,
+                            "object": "chat.completion.chunk",
+                            "created": created_time,
+                            "model": request.model,
+                            "choices": [{
+
+                                "index": 0,
+                                "delta": {"content": chunk.content},
+                                "finish_reason": None
+                            }]
+                        }
+
+                        yield f"data: {json.dumps(payload)}\n\n"
+                        
+                # Sinal de Encerramento (Final Reason: stop)
+                end_payload = {
+
+                    "id": req_id,
+                    "object": "chat.completion.chunk",
+                    "created": created_time,
+                    "model": request.model,
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+                }
+
+                yield f"data: {json.dumps(end_payload)}\n\n"
+                yield "data: [DONE]\n\n"
+
+            except Exception as stream_err:
+
+                print(f"[Erro de Stream]: {stream_err}")
+                yield "data: [DONE]\n\n"
+                
         return StreamingResponse(sse_generator(), media_type="text/event-stream")
 
-    # 3. Fallback caso stream=False
-    response = await llm.ainvoke(final_prompt)
+    # 4. Fallback caso a IDE peça retorno síncrono (sem stream)
+
+    response = await main_llm.ainvoke(final_prompt)
     return {
+
         "id": req_id,
         "object": "chat.completion",
         "created": created_time,
@@ -293,5 +443,6 @@ async def chat_completions(request: ChatCompletionRequest):
     }
 
 if __name__ == "__main__":
-    print("=== Iniciando Proxy LangGraph na porta 8000 ===")
+
+    print("=== Iniciando LangGraph Proxy (Gemma4/LFM) na porta 8000 ===")
     uvicorn.run(app, host="127.0.0.1", port=8000)

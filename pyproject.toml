@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "langgraph-continue-proxy"
-version = "0.1.0"
+version = "0.2.1"
 description = "Reverse Proxy em FastAPI + LangGraph com compactação de contexto e busca Tavily para o Continue.dev"
 readme = "README.md"
 requires-python = ">=3.10"
