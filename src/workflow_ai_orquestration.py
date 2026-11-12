@@ -43,7 +43,7 @@ app.add_middleware(
 # Gemma 4 (Principal / Reasoning)
 main_llm = ChatOpenAI(
     base_url="http://localhost:1234/v1",
-    model="google/gemma4-e4b",
+    model="qwen/qwen3-1.7b",
     temperature=0.2,
     top_p=0.9
 )
